@@ -56,6 +56,7 @@ struct va_pool_t
 
     atomic_uintptr_t  poolrefs; // 1 ref for the pool creator, 1 ref per surface alive
     vlc_sem_t    available_surfaces;
+    vlc_va_t     *va; /* for logging, only used while decoding */
 };
 
 static void va_pool_AddRef(va_pool_t *va_pool)
@@ -138,7 +139,18 @@ vlc_va_surface_t *va_pool_Get(va_pool_t *va_pool)
     if (unlikely(va_pool->surface_count == 0))
         return NULL;
 
-    vlc_sem_wait(&va_pool->available_surfaces);
+    /* Never wait forever: libavcodec can request more surfaces than it
+     * declared (e.g. HEVC generate_missing_ref after frames were skipped,
+     * multiplied by frame threads). If the pool is exhausted, nobody will
+     * release a surface and the decoder (and the input thread joining it)
+     * would deadlock. Failing the allocation only drops that frame. */
+    if (vlc_sem_timedwait(&va_pool->available_surfaces,
+                          vlc_tick_now() + VLC_TICK_FROM_SEC(1)))
+    {
+        msg_Warn(va_pool->va, "no free surface after 1s (%zu surfaces), "
+                 "dropping frame", va_pool->surface_count);
+        return NULL;
+    }
     surface = GetSurface(va_pool);
     assert(surface != NULL);
     return surface;
@@ -185,6 +197,7 @@ va_pool_t * va_pool_Create(vlc_va_t *va, const struct va_pool_cfg *cbs)
         return NULL;
 
     va_pool->callbacks = *cbs;
+    va_pool->va = va;
 
     /* */
     if (cbs->pf_create_device(va)) {
