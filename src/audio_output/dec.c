@@ -41,6 +41,8 @@
 
 #define BLOCK_FLAG_CORE_PRIVATE_FILTERED (1 << BLOCK_FLAG_CORE_PRIVATE_SHIFT)
 
+#define AOUT_RATE_SEGMENTS 32
+
 struct vlc_aout_stream
 {
     aout_instance_t *instance;
@@ -72,16 +74,27 @@ struct vlc_aout_stream
 
     struct
     {
-        vlc_mutex_t lock; /* Guard first_pts, last_drift, rate_system_ts,
-                             rate_audio_ts, system_ts, audio_ts */
+        vlc_mutex_t lock; /* Guard first_pts, last_drift, rate segments,
+                             system_ts, audio_ts */
 
         vlc_tick_t last_drift;
 
         vlc_tick_t first_pts;
         int64_t played_samples; /* Used for stream_GetDelay() emulation */
 
-        vlc_tick_t rate_system_ts;
-        vlc_tick_t rate_audio_ts;
+        /* Rate segments, oldest first. A segment starts at the output
+         * position (first_pts + played length, the same base as the audio_ts
+         * reported by the module) of the first block played at a new rate.
+         * The output is written ahead of the playback, so several rate
+         * changes can be queued before being played. */
+        struct
+        {
+            vlc_tick_t output_ts;
+            vlc_tick_t audio_ts;
+            float rate;
+        } segs[AOUT_RATE_SEGMENTS];
+        unsigned segs_first;
+        unsigned segs_count;
 
         vlc_tick_t system_ts;
         vlc_tick_t audio_ts;
@@ -320,8 +333,10 @@ static void stream_Reset(vlc_aout_stream *stream)
             stream_ResetDiscontinuity(stream);
     }
 
-    stream->timing.rate_audio_ts = VLC_TICK_INVALID;
+    vlc_mutex_lock(&stream->timing.lock);
+    stream->timing.segs_first = stream->timing.segs_count = 0;
     stream->timing.rate = 1.0;
+    vlc_mutex_unlock(&stream->timing.lock);
 
     atomic_store_explicit(&stream->drained, false, memory_order_relaxed);
     atomic_store_explicit(&stream->drain_deadline, VLC_TICK_INVALID,
@@ -386,7 +401,7 @@ vlc_aout_stream * vlc_aout_stream_New(audio_output_t *p_aout,
     stream->sync.clock_id = 0;
     stream->str_id = cfg->str_id;
 
-    stream->timing.rate_audio_ts = VLC_TICK_INVALID;
+    stream->timing.segs_first = stream->timing.segs_count = 0;
     stream->timing.rate = 1.f;
 
     vlc_mutex_init(&stream->timing.lock);
@@ -723,6 +738,73 @@ static void stream_HandleDrift(vlc_aout_stream *stream, vlc_tick_t drift,
     }
 }
 
+static void stream_PushRateSegment(vlc_aout_stream *stream,
+                                   vlc_tick_t output_ts, vlc_tick_t audio_ts,
+                                   float rate)
+{
+    vlc_mutex_assert(&stream->timing.lock);
+    unsigned count = stream->timing.segs_count;
+    unsigned idx;
+
+    if (count > 0 && stream->timing.segs[(stream->timing.segs_first + count - 1)
+                         % AOUT_RATE_SEGMENTS].output_ts == output_ts)
+        /* Nothing was played at the previous rate: replace it */
+        idx = (stream->timing.segs_first + count - 1) % AOUT_RATE_SEGMENTS;
+    else
+    {
+        if (count == AOUT_RATE_SEGMENTS)
+        {
+            /* Drop the oldest segment */
+            stream->timing.segs_first =
+                (stream->timing.segs_first + 1) % AOUT_RATE_SEGMENTS;
+            count--;
+        }
+        idx = (stream->timing.segs_first + count) % AOUT_RATE_SEGMENTS;
+        stream->timing.segs_count = count + 1;
+    }
+    stream->timing.segs[idx].output_ts = output_ts;
+    stream->timing.segs[idx].audio_ts = audio_ts;
+    stream->timing.segs[idx].rate = rate;
+}
+
+/* Convert an output position, reported by the module, to a stream timestamp,
+ * according to the rate the output was playing at this position. */
+static vlc_tick_t stream_OutputToStreamTs(vlc_aout_stream *stream,
+                                          vlc_tick_t output_ts, float *rate)
+{
+    vlc_mutex_assert(&stream->timing.lock);
+
+    if (stream->timing.segs_count == 0)
+    {
+        *rate = 1.f;
+        return output_ts;
+    }
+
+    /* Forget the segments that were entirely played */
+    while (stream->timing.segs_count > 1)
+    {
+        unsigned next = (stream->timing.segs_first + 1) % AOUT_RATE_SEGMENTS;
+        if (output_ts < stream->timing.segs[next].output_ts)
+            break;
+        stream->timing.segs_first = next;
+        stream->timing.segs_count--;
+    }
+
+    const unsigned first = stream->timing.segs_first;
+    if (output_ts < stream->timing.segs[first].output_ts)
+    {
+        /* The first rate change since the last reset was not played yet:
+         * the output is still at rate 1, its position is the stream ts. */
+        *rate = 1.f;
+        return output_ts;
+    }
+
+    /* Each output tick played at this rate plays 'rate' stream ticks */
+    *rate = stream->timing.segs[first].rate;
+    return stream->timing.segs[first].audio_ts
+         + (output_ts - stream->timing.segs[first].output_ts) * *rate;
+}
+
 static void stream_Synchronize(vlc_aout_stream *stream, vlc_tick_t system_now,
                                vlc_tick_t play_date, vlc_tick_t dec_pts)
 {
@@ -747,16 +829,20 @@ static void stream_Synchronize(vlc_aout_stream *stream, vlc_tick_t system_now,
     assert(system_now != VLC_TICK_INVALID);
 
     vlc_mutex_lock(&stream->timing.lock);
-    if (stream->sync.rate != stream->timing.rate)
-    {
-        /* Save the first timing point seeing a rate change */
-        stream->timing.rate_system_ts = play_date;
-        stream->timing.rate_audio_ts = dec_pts;
-        stream->timing.rate = stream->sync.rate;
-    }
-
     if (stream->timing.first_pts == VLC_TICK_INVALID)
         stream->timing.first_pts = dec_pts;
+
+    if (stream->sync.rate != stream->timing.rate)
+    {
+        /* Start a new rate segment at the output position of this block
+         * (played_samples does not include it yet) */
+        vlc_tick_t output_ts = stream->timing.first_pts +
+            vlc_tick_from_samples(stream->timing.played_samples,
+                                  stream->mixer_format.i_rate);
+        stream_PushRateSegment(stream, output_ts, dec_pts,
+                               stream->sync.rate);
+        stream->timing.rate = stream->sync.rate;
+    }
 
     bool is_drifting = stream->timing.last_drift != VLC_TICK_INVALID;
 
@@ -782,33 +868,18 @@ void vlc_aout_stream_NotifyTiming(vlc_aout_stream *stream, vlc_tick_t system_ts,
 {
     vlc_mutex_lock(&stream->timing.lock);
 
-    vlc_tick_t rate_audio_ts = stream->timing.rate_audio_ts;
-    vlc_tick_t rate_system_ts = stream->timing.rate_system_ts;
-
     /* audio_ts is the output position: at rate != 1, it advances with the
      * output samples, like played_samples, not with the stream timestamps
      * of the clock. */
-    vlc_tick_t clock_audio_ts = audio_ts;
-    if (rate_audio_ts != VLC_TICK_INVALID)
-    {
-        /* Drop timing updates that comes before the rate change */
-        if (system_ts < rate_system_ts)
-        {
-            vlc_mutex_unlock(&stream->timing.lock);
-            return;
-        }
-
-        /* Fix the audio timestamp with the rate */
-        clock_audio_ts = rate_audio_ts + (system_ts - rate_system_ts)
-                         * stream->timing.rate;
-    }
+    float rate;
+    vlc_tick_t clock_audio_ts = stream_OutputToStreamTs(stream, audio_ts,
+                                                        &rate);
 
     stream->timing.system_ts = system_ts;
     stream->timing.audio_ts = audio_ts;
     vlc_clock_Lock(stream->sync.clock);
     stream->timing.last_drift =
-        vlc_clock_Update(stream->sync.clock, system_ts,
-                         clock_audio_ts, stream->timing.rate);
+        vlc_clock_Update(stream->sync.clock, system_ts, clock_audio_ts, rate);
     vlc_clock_Unlock(stream->sync.clock);
     vlc_mutex_unlock(&stream->timing.lock);
 }
@@ -974,18 +1045,6 @@ void vlc_aout_stream_ChangePause(vlc_aout_stream *stream, bool paused, vlc_tick_
             aout->pause(aout, paused, date);
         else if (paused)
             vlc_aout_stream_Flush(stream);
-
-        /* Update the rate point after the pause */
-        if (!paused && stream->timing.rate_audio_ts != VLC_TICK_INVALID)
-        {
-            vlc_clock_Lock(stream->sync.clock);
-            vlc_tick_t play_date =
-                vlc_clock_ConvertToSystem(stream->sync.clock, date,
-                                          stream->timing.rate_audio_ts,
-                                          stream->sync.rate, NULL);
-            vlc_clock_Unlock(stream->sync.clock);
-            stream->timing.rate_system_ts = play_date;
-        }
     }
 }
 
