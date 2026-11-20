@@ -72,12 +72,25 @@ static void aout_Stop(audio_output_t *aout)
     (void) aout;
 }
 
+static vlc_tick_t mock_now = VLC_TICK_0;
+
+/* Output position reported when resuming, VLC_TICK_INVALID to not report */
+static vlc_tick_t pause_report_ts = VLC_TICK_INVALID;
+
+static void aout_Pause(audio_output_t *aout, bool paused, vlc_tick_t date)
+{
+    (void) date;
+    /* Like WASAPI, report the timing synchronously when resuming */
+    if (!paused && pause_report_ts != VLC_TICK_INVALID)
+        aout_TimingReport(aout, mock_now, pause_report_ts);
+}
+
 static int aout_Open(vlc_object_t *obj)
 {
     audio_output_t *aout = (audio_output_t *)obj;
     aout->start = aout_Start;
     aout->play = aout_Play;
-    aout->pause = NULL;
+    aout->pause = aout_Pause;
     aout->flush = aout_Flush;
     aout->stop = aout_Stop;
     aout->drain = NULL;
@@ -92,7 +105,21 @@ static int resampling;
 static block_t *resampler_Resample(filter_t *f, block_t *in)
 {
     resampling = (int)f->fmt_in.audio.i_rate - (int)f->fmt_out.audio.i_rate;
-    return in;
+    if (resampling == 0)
+        return in;
+
+    /* Output as many samples as a real resampler (used as rate filter) */
+    unsigned nb = (uint64_t)in->i_nb_samples * f->fmt_out.audio.i_rate
+                / f->fmt_in.audio.i_rate;
+    block_t *out = block_Alloc(nb * f->fmt_out.audio.i_bytes_per_frame);
+    assert(out != NULL);
+    memset(out->p_buffer, 0, out->i_buffer);
+    out->i_nb_samples = nb;
+    out->i_pts = in->i_pts;
+    out->i_dts = in->i_dts;
+    out->i_length = vlc_tick_from_samples(nb, f->fmt_out.audio.i_rate);
+    block_Release(in);
+    return out;
 }
 
 static int resampler_Open(vlc_object_t *obj)
@@ -125,8 +152,6 @@ int vout_Request(const void *cfg, void *vctx, void *input)
 { (void) cfg; (void) vctx; (void) input; return -1; }
 bool config_IsSafe(const char *name);
 bool config_IsSafe(const char *name) { (void) name; return false; }
-
-static vlc_tick_t mock_now = VLC_TICK_0;
 
 vlc_tick_t vlc_tick_now(void)
 {
@@ -243,6 +268,139 @@ static void test_flush_stops_resampling(libvlc_int_t *vlc)
     vlc_clock_main_Delete(clockbus);
 }
 
+static void check_clock(vlc_clock_t *clock, vlc_tick_t system, vlc_tick_t ts,
+                        double rate)
+{
+    vlc_clock_Lock(clock);
+    vlc_tick_t converted = vlc_clock_ConvertToSystem(clock, system, ts, rate,
+                                                     NULL);
+    vlc_clock_Unlock(clock);
+    vlc_tick_t diff = converted - system;
+    if (diff < -VLC_TICK_FROM_MS(1) || diff > VLC_TICK_FROM_MS(1))
+    {
+        fprintf(stderr, "clock off by %"PRId64" us\n", diff);
+        abort();
+    }
+}
+
+/* The timings reported by the output are output positions: at rate != 1,
+ * they must be converted to stream timestamps with the rate the output was
+ * playing at, even if more rate changes are already queued in the output, or
+ * if the output reports while resuming from pause. */
+static void test_rate_change_timings(libvlc_int_t *vlc)
+{
+    struct vlc_logger *logger = vlc->obj.logger;
+
+    audio_sample_format_t fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.i_format = VLC_CODEC_S16N;
+    fmt.i_rate = 48000;
+    fmt.i_physical_channels = AOUT_CHANS_STEREO;
+    aout_FormatPrepare(&fmt);
+
+    const vlc_tick_t frame_len = vlc_tick_from_samples(NB_SAMPLES, fmt.i_rate);
+
+    vlc_clock_main_t *clockbus = vlc_clock_main_New(logger, NULL);
+    assert(clockbus != NULL);
+
+    vlc_clock_main_Lock(clockbus);
+    vlc_clock_main_SetDejitter(clockbus, 0);
+    vlc_clock_t *aout_clock =
+        vlc_clock_main_CreateMaster(clockbus, "audio", NULL, NULL);
+    assert(aout_clock != NULL);
+    vlc_clock_main_Unlock(clockbus);
+
+    const vlc_tick_t sys0 = VLC_TICK_0 + VLC_TICK_FROM_MS(1000);
+    const vlc_tick_t stream0 = VLC_TICK_0 + VLC_TICK_FROM_MS(1000);
+    mock_now = sys0;
+
+    var_Create(vlc, "aout", VLC_VAR_STRING);
+    var_SetString(vlc, "aout", MODULE_STRING);
+    var_Create(vlc, "audio-time-stretch", VLC_VAR_BOOL);
+    var_SetBool(vlc, "audio-time-stretch", false);
+
+    audio_output_t *aout = aout_New(vlc);
+    assert(aout != NULL);
+
+    const struct vlc_aout_stream_cfg cfg = {
+        .fmt = &fmt,
+        .profile = 0,
+        .clock = aout_clock,
+        .str_id = "audio",
+        .replay_gain = NULL,
+    };
+    vlc_aout_stream *stream = vlc_aout_stream_New(aout, &cfg);
+    assert(stream != NULL);
+
+    start_output(aout_clock, sys0, stream0);
+
+    /* Queue 10 blocks at x1, then 10 at x2, then 10 at x4 in the output
+     * before it plays any of them. */
+    enum { K = 10 };
+    vlc_tick_t pts = stream0;
+    for (int i = 0; i < K; i++, pts += frame_len)
+        vlc_aout_stream_Play(stream, make_frame(&fmt, pts));
+
+    vlc_aout_stream_ChangeRate(stream, 2.f);
+    const vlc_tick_t pts_x2 = pts;
+    const vlc_tick_t out_x2 = stream0
+        + vlc_tick_from_samples(K * NB_SAMPLES, fmt.i_rate);
+    for (int i = 0; i < K; i++, pts += frame_len)
+        vlc_aout_stream_Play(stream, make_frame(&fmt, pts));
+
+    vlc_aout_stream_ChangeRate(stream, 4.f);
+    const vlc_tick_t pts_x4 = pts;
+    const vlc_tick_t out_x4 = stream0
+        + vlc_tick_from_samples(K * NB_SAMPLES + K * NB_SAMPLES / 2,
+                                fmt.i_rate);
+    for (int i = 0; i < K; i++, pts += frame_len)
+        vlc_aout_stream_Play(stream, make_frame(&fmt, pts));
+
+    /* The output plays in real time from sys0: output position stream0 is
+     * played at sys0. */
+
+    /* Halfway through the x2 segment, while the x4 change is queued */
+    vlc_tick_t out = out_x2 + vlc_tick_from_samples(K * NB_SAMPLES / 4,
+                                                    fmt.i_rate);
+    mock_now = sys0 + (out - stream0);
+    aout_TimingReport(aout, mock_now, out);
+    check_clock(aout_clock, mock_now, pts_x2 + (out - out_x2) * 2, 2.0);
+
+    /* In the x4 segment */
+    out = out_x4 + vlc_tick_from_samples(K * NB_SAMPLES / 8, fmt.i_rate);
+    mock_now = sys0 + (out - stream0);
+    aout_TimingReport(aout, mock_now, out);
+    const vlc_tick_t ts_paused = pts_x4 + (out - out_x4) * 4;
+    check_clock(aout_clock, mock_now, ts_paused, 4.0);
+
+    /* Pause 5 seconds: the output reports the same position when resumed */
+    const vlc_tick_t pause_date = mock_now;
+    vlc_clock_main_Lock(clockbus);
+    vlc_clock_main_ChangePause(clockbus, pause_date, true);
+    vlc_clock_main_Unlock(clockbus);
+    vlc_aout_stream_ChangePause(stream, true, pause_date);
+
+    mock_now += VLC_TICK_FROM_SEC(5);
+    pause_report_ts = out;
+    vlc_clock_main_Lock(clockbus);
+    vlc_clock_main_ChangePause(clockbus, mock_now, false);
+    vlc_clock_main_Unlock(clockbus);
+    vlc_aout_stream_ChangePause(stream, false, mock_now);
+    pause_report_ts = VLC_TICK_INVALID;
+    check_clock(aout_clock, mock_now, ts_paused, 4.0);
+
+    /* And it continues from there */
+    out += VLC_TICK_FROM_MS(10);
+    mock_now += VLC_TICK_FROM_MS(10);
+    aout_TimingReport(aout, mock_now, out);
+    check_clock(aout_clock, mock_now, ts_paused + VLC_TICK_FROM_MS(40), 4.0);
+
+    vlc_aout_stream_Delete(stream);
+    aout_Release(aout);
+    vlc_clock_Delete(aout_clock);
+    vlc_clock_main_Delete(clockbus);
+}
+
 int main(void)
 {
     test_init();
@@ -251,6 +409,7 @@ int main(void)
     assert(vlc != NULL);
 
     test_flush_stops_resampling(vlc->p_libvlc_int);
+    test_rate_change_timings(vlc->p_libvlc_int);
 
     libvlc_release(vlc);
     return 0;
